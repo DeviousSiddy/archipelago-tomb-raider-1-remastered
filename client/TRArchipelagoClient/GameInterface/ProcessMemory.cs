@@ -22,10 +22,56 @@ public class ProcessMemory : IDisposable
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr hObject);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr CreateRemoteThread(
+        IntPtr hProcess, IntPtr lpThreadAttributes, UIntPtr dwStackSize,
+        IntPtr lpStartAddress, IntPtr lpParameter, uint dwCreationFlags, out IntPtr lpThreadId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetExitCodeThread(IntPtr hThread, out uint lpExitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenThread(uint dwDesiredAccess, bool bInheritHandle, uint dwThreadId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint SuspendThread(IntPtr hThread);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint ResumeThread(IntPtr hThread);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr CreateToolhelp32Snapshot(uint dwFlags, uint th32ProcessID);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool Thread32First(IntPtr hSnapshot, ref THREADENTRY32 lpte);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool Thread32Next(IntPtr hSnapshot, ref THREADENTRY32 lpte);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct THREADENTRY32
+    {
+        public uint dwSize;
+        public uint cntUsage;
+        public uint th32ThreadID;
+        public uint th32OwnerProcessID;
+        public int tpBasePri;
+        public int tpDeltaPri;
+        public uint dwFlags;
+    }
+
     private const int PROCESS_VM_READ = 0x0010;
     private const int PROCESS_VM_WRITE = 0x0020;
     private const int PROCESS_VM_OPERATION = 0x0008;
     private const int PROCESS_QUERY_INFORMATION = 0x0400;
+    private const int PROCESS_CREATE_THREAD = 0x0002;
+
+    private const uint TH32CS_SNAPTHREAD = 0x00000004;
+    private const uint THREAD_SUSPEND_RESUME = 0x0002;
+    private const uint WAIT_OBJECT_0 = 0x00000000;
 
     private IntPtr _processHandle;
     private Process? _gameProcess;
@@ -53,7 +99,7 @@ public class ProcessMemory : IDisposable
         _gameProcess = processes[0];
 
         _processHandle = OpenProcess(
-            PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION,
+            PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION | PROCESS_CREATE_THREAD,
             false,
             _gameProcess.Id);
 
@@ -62,6 +108,9 @@ public class ProcessMemory : IDisposable
 
         _exeBaseAddress = _gameProcess.MainModule?.BaseAddress ?? IntPtr.Zero;
         _tomb1DllBase = FindModuleBase(TR1RMemoryMap.TR1ModuleName);
+
+        // Offset layer keys its manifest on the on-disk build of the host exe.
+        OffsetModel.CurrentExePath ??= _gameProcess.MainModule?.FileName;
 
         return true;
     }
@@ -227,6 +276,78 @@ public class ProcessMemory : IDisposable
     /// <summary>Writes a 16-bit integer to process memory.</summary>
     public bool WriteInt16(IntPtr address, short value)
         => Write(address, value);
+
+    // =================================================================
+    // REMOTE CALL (CreateRemoteThread)
+    // =================================================================
+
+    /// <summary>
+    /// Calls a function inside the attached process via CreateRemoteThread.
+    /// The target must have the signature DWORD fn(int arg) — arg arrives in RCX
+    /// (x64 first parameter / thread parameter). All other threads of the target
+    /// process are suspended while the call runs so it does not race the game's
+    /// main loop; they are always resumed in finally.
+    /// Returns the remote function's return value (EAX) or null on failure/timeout.
+    /// On timeout the remote thread is left to finish once threads resume; the
+    /// caller should treat null as "retry later". Exit codes are informational
+    /// only — callers must verify effects (e.g. ring read-back), because
+    /// Inv_AddItem returns 0 both for success and refusal in some paths.
+    /// </summary>
+    public uint? CallRemote(IntPtr func, int arg, int timeoutMs = 2000)
+    {
+        if (!IsAttached || _processHandle == IntPtr.Zero || func == IntPtr.Zero || _gameProcess == null)
+            return null;
+
+        var suspended = new List<IntPtr>();
+        IntPtr snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snapshot != new IntPtr(-1))
+        {
+            var te = new THREADENTRY32 { dwSize = (uint)Marshal.SizeOf<THREADENTRY32>() };
+            if (Thread32First(snapshot, ref te))
+            {
+                do
+                {
+                    if (te.th32OwnerProcessID != (uint)_gameProcess.Id)
+                        continue;
+                    IntPtr hThread = OpenThread(THREAD_SUSPEND_RESUME, false, te.th32ThreadID);
+                    if (hThread == IntPtr.Zero)
+                        continue;
+                    if (SuspendThread(hThread) != 0xFFFFFFFF)
+                        suspended.Add(hThread);
+                    else
+                        CloseHandle(hThread);
+                } while (Thread32Next(snapshot, ref te));
+            }
+            CloseHandle(snapshot);
+        }
+
+        IntPtr hRemote = IntPtr.Zero;
+        try
+        {
+            hRemote = CreateRemoteThread(_processHandle, IntPtr.Zero, UIntPtr.Zero,
+                func, new IntPtr(arg), 0, out _);
+            if (hRemote == IntPtr.Zero)
+                return null;
+
+            if (WaitForSingleObject(hRemote, (uint)timeoutMs) != WAIT_OBJECT_0)
+                return null;
+
+            if (!GetExitCodeThread(hRemote, out uint exitCode))
+                return null;
+
+            return exitCode;
+        }
+        finally
+        {
+            if (hRemote != IntPtr.Zero)
+                CloseHandle(hRemote);
+            foreach (IntPtr h in suspended)
+            {
+                ResumeThread(h);
+                CloseHandle(h);
+            }
+        }
+    }
 
     // =================================================================
     // AOB SCANNING

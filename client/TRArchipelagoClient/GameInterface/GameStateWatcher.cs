@@ -41,6 +41,12 @@ public class GameStateWatcher : IDisposable
     private int _lastLevelCompleted;
     private ushort _lastSecretsFound;
     private int _itemsReceivedIndex;
+
+    // How many ring items have actually been written into the game this session.
+    // Snapshots persist this so a stale snapshot can never suppress items that
+    // reached the AP stream but never reached the inventory.
+    private int _itemsInjectedIndex;
+    private int _injectionFailures;
     private int _lastSaveNumber = -1;
 
     // The save number of the currently active snapshot (for save-aware checks)
@@ -48,6 +54,11 @@ public class GameStateWatcher : IDisposable
 
     // Tracks KeyItemsEnsured transition to re-snapshot the KeyItemMonitor
     private bool _lastKeyItemsEnsured;
+
+    // Offset identification: run once per session after the first level settles,
+    // then re-run whenever a group failed or was quarantined.
+    private bool _offsetsIdentified;
+    private readonly string? _saveFile;
 
     // Saved Lara pointer to detect heap shifts (real load vs inventory open)
     private IntPtr _laraPtrBeforeTransition;
@@ -77,7 +88,8 @@ public class GameStateWatcher : IDisposable
         APSession session,
         ProcessMemory memory,
         Dictionary<int, Dictionary<int, long>> levelEntityLocations,
-        SaveStateStore stateStore)
+        SaveStateStore stateStore,
+        string? saveFile = null)
     {
         _session = session;
         _memory = memory;
@@ -86,6 +98,7 @@ public class GameStateWatcher : IDisposable
         _inventory.Scanner = _scanner;
         _levelEntityLocations = levelEntityLocations;
         _stateStore = stateStore;
+        _saveFile = saveFile;
         _keyMonitor = new KeyItemMonitor(memory);
     }
 
@@ -280,8 +293,10 @@ public class GameStateWatcher : IDisposable
         // Detect key items consumed in doors/locks
         CheckKeyItemUsage(levelId);
 
-        // Auto-find live inventory address
-        _scanner.Poll(_tomb1Base);
+        // Legacy value-space discovery scanner: disabled. The ring offsets are
+        // identified structurally now and its baseline scans enumerate hundreds
+        // of millions of candidates (gigabytes + seconds of stall per scan).
+        // _scanner.Poll(_tomb1Base);
 
         // Process received items from AP
         ProcessReceivedItems(levelId);
@@ -360,6 +375,7 @@ public class GameStateWatcher : IDisposable
             CheckedEntityLocations = checkedEntities,
             CheckedSecretLocations = checkedSecrets,
             ItemsReceivedIndex = _itemsReceivedIndex,
+            ItemsInjectedIndex = _itemsInjectedIndex,
         };
 
         _stateStore.RecordSave(saveNumber, snapshot);
@@ -419,22 +435,74 @@ public class GameStateWatcher : IDisposable
         // Set used key items so EnsureKeyItemsInRing skips them
         _inventory.SetUsedKeyItems(new Dictionary<long, int>(snapshot.UsedKeyItems));
 
-        // Queue ring items received AFTER this save for re-injection
-        int savedIndex = snapshot.ItemsReceivedIndex;
-        if (savedIndex < _allReceivedRingItems.Count)
+        // Queue ring items that were received but never made it into the game.
+        // A snapshot only covers what was actually injected at save time
+        // (ItemsInjectedIndex; absent/0 in legacy snapshots), and the live count
+        // protects against re-queueing what this session already injected.
+        int receivedCount = _allReceivedRingItems.Count;
+        int from = Math.Max(snapshot.ItemsInjectedIndex, _itemsInjectedIndex);
+        if (from < receivedCount)
         {
-            int count = _allReceivedRingItems.Count - savedIndex;
+            int count = receivedCount - from;
             _pendingItems.Clear();
-            for (int i = savedIndex; i < _allReceivedRingItems.Count; i++)
+            for (int i = from; i < receivedCount; i++)
                 _pendingItems.Enqueue(_allReceivedRingItems[i]);
 
             ConsoleUI.Info($"[SAVE] Queued {count} ring items received after save #{_activeSaveNumber}");
+        }
+        else if (receivedCount > 0)
+        {
+            // Loud on purpose: this is the branch that used to silently drop
+            // everything when a stale snapshot claimed the items were delivered.
+            ConsoleUI.Info(
+                $"[SAVE] Nothing to queue for save #{_activeSaveNumber} " +
+                $"(received={receivedCount}, injected={_itemsInjectedIndex}, snapshot injected={snapshot.ItemsInjectedIndex})");
         }
 
         // Reconcile key items for the current level
         if (mapperIdx >= 0)
         {
             _inventory.ReconcileKeyItems(mapperIdx, new Dictionary<long, int>(snapshot.UsedKeyItems));
+        }
+    }
+
+    /// <summary>
+    /// Offset identification pass, run from OnSettleComplete (the engine has
+    /// finished initializing the level, so the snapshot is trustworthy):
+    ///
+    ///   first call  - validate every group against the live build, defer Ring
+    ///   every call  - retry groups still Pending or quarantined by WriteGate
+    ///                 (one recalculation attempt per level transition)
+    ///   every call  - one Ring invariant pass; a full re-scan only when Ring
+    ///                 is quarantined or its invariants fail
+    ///
+    /// Failures report "VERSION DIFF DETECTED" with the build hash instead of
+    /// silently corrupting game state.
+    /// </summary>
+    private void EnsureOffsetsValid()
+    {
+        try
+        {
+            if (!_offsetsIdentified)
+            {
+                _offsetsIdentified = true;
+                OffsetIdentifier.IdentifyOnAttach(_memory, _saveFile);
+            }
+
+            foreach (var group in OffsetModel.AllGroups)
+            {
+                if (group == OffsetGroup.Ring) continue;
+                var state = OffsetModel.Report(group).State;
+                if (state is OffsetState.Pending or OffsetState.Quarantined)
+                    OffsetIdentifier.Revalidate(_memory, group, _saveFile);
+            }
+
+            OffsetIdentifier.IdentifyRing(_memory,
+                forceResolve: OffsetModel.Report(OffsetGroup.Ring).State == OffsetState.Quarantined);
+        }
+        catch (Exception ex)
+        {
+            ConsoleUI.Error($"[OFFSET] identification error: {ex.Message}");
         }
     }
 
@@ -462,6 +530,7 @@ public class GameStateWatcher : IDisposable
 
         // Reset per-level state
         _entityFlags.Clear();
+        _injectionFailures = 0;
         _lastSecretsFound = 0;
         _lastLevelCompleted = 0;
         _lastHealth = TR1RMemoryMap.MaxHealth;
@@ -481,6 +550,11 @@ public class GameStateWatcher : IDisposable
     /// </summary>
     private void OnSettleComplete(int levelId)
     {
+        // Offset map first — every snapshot and injection below depends on it.
+        // Runs once per settled level, so a quarantined group gets exactly one
+        // recalculation attempt per level transition.
+        EnsureOffsetsValid();
+
         // Drain the AP item queue BEFORE reconciling.
         // Items accumulate during settle — we need them in _allReceivedRingItems
         // so ReconcileAfterLoad can correctly slice by savedIndex.
@@ -506,14 +580,30 @@ public class GameStateWatcher : IDisposable
 
         if (_settleFromMenu)
         {
-            // Detect new game vs loaded save by checking the Main Ring.
-            // New game: ring has only Compass + Pistols (count = 2).
-            // Loaded save: ring has additional items from the save.
-            short ringCount = _memory.ReadInt16(_memory.Tomb1Base + TR1RMemoryMap.MainRingCount);
+            // Detect new game vs loaded save from the Main Ring contents.
+            // New game: ring holds only Compass + Pistols (Compass is ring[0],
+            // Pistols sits Compass apart, so the walked length is 2).
+            // Loaded save: ring holds additional items carried in the save.
+            // Only trust the walk when the Ring offsets are usable; otherwise
+            // leave the decision to the next settle rather than guess.
+            short ringCount = OffsetIdentifier.RingWalk(_memory, TR1RMemoryMap.MainRingItems);
+            bool ringUsable = OffsetModel.Usable(OffsetGroup.Ring);
+            bool newGame = ringUsable && ringCount <= 2 && _allReceivedRingItems.Count > 0;
 
-            if (ringCount <= 2 && _allReceivedRingItems.Count > 0)
+            ConsoleUI.Info(
+                $"[GSW] Menu→game settle: ring={ringCount} ringUsable={ringUsable} " +
+                $"received={_allReceivedRingItems.Count} → {(newGame ? "NEW GAME" : "loaded save")}");
+
+            if (newGame)
             {
-                // New game — replay all ring items (no snapshot exists for fresh games)
+                // Brand-new game: the game wiped the inventory, so no cached save
+                // describes it anymore. Drop every stale per-save snapshot, reset
+                // the injection cursor and replay all received ring items. The AP
+                // server owns check dedup, so nothing is re-sent here.
+                _stateStore.ResetForNewGame();
+                _activeSaveNumber = -1;
+                _itemsInjectedIndex = 0;
+                _injectionFailures = 0;
                 _pendingItems.Clear();
                 foreach (var item in _allReceivedRingItems)
                     _pendingItems.Enqueue(item);
@@ -570,7 +660,23 @@ public class GameStateWatcher : IDisposable
 
     /// <summary>
     /// Checks each tracked entity for flag changes (pickup detection).
-    /// Uses the active save snapshot to distinguish real pickups from reload artifacts.
+    ///
+    /// The ONLY pickup signal is a change in an entity's flags between the
+    /// level-entry baseline (<see cref="_entityFlags"/>, refreshed on every level
+    /// entry / load / save-update) and the live value. We deliberately do NOT
+    /// consult any local "already checked" set to decide whether a pickup
+    /// happened:
+    ///
+    ///  - AP-side dedup is owned by the AP server. <see cref="APSession.SendLocationCheck"/>
+    ///    is idempotent and returns whether the check was new; the server is the
+    ///    single source of truth for what has already been sent.
+    ///  - Local checked-sets are only a per-save cache. Gating pickup handling on
+    ///    them (as the previous implementation did) let a stale cache suppress the
+    ///    vanilla-item strip, leaking the parasitic sentinel medipack.
+    ///
+    /// Because the baseline is re-snapshotted at every load, a reloaded save
+    /// produces no flag change and therefore no pickup (and no send, and no
+    /// strip) — reload artifacts are handled structurally, not by heuristic.
     /// </summary>
     private void CheckEntityPickups(int levelId)
     {
@@ -584,46 +690,44 @@ public class GameStateWatcher : IDisposable
             if (_entitiesBase == IntPtr.Zero) return;
         }
 
-        // Get the active snapshot for save-aware checking
-        var activeSnapshot = _stateStore.GetSnapshot(_activeSaveNumber);
-
         var entityLocations = _levelEntityLocations[mapperIdx];
         foreach (var (entityIndex, locationId) in entityLocations)
         {
             IntPtr entityAddr = _entitiesBase + (entityIndex * TR1RMemoryMap.EntitySize);
             short currentFlags = _memory.ReadInt16(entityAddr + TR1RMemoryMap.Item_Flags);
 
-            if (_entityFlags.TryGetValue(entityIndex, out short previousFlags))
+            if (!_entityFlags.TryGetValue(entityIndex, out short previousFlags))
             {
-                if (currentFlags != previousFlags)
-                {
-                    _entityFlags[entityIndex] = currentFlags;
-
-                    // If this location was already checked in the active snapshot,
-                    // this is a reload artifact — skip both the AP send and sentinel removal.
-                    if (activeSnapshot != null && activeSnapshot.CheckedEntityLocations.Contains(locationId))
-                        continue;
-
-                    bool isNew = _session.SendLocationCheck(locationId);
-                    if (isNew)
-                    {
-                        string locName = _session.GetLocationName(locationId);
-                        ConsoleUI.ItemSent(locName, "Archipelago");
-                    }
-
-                    // Update the active snapshot with the new check
-                    activeSnapshot?.CheckedEntityLocations.Add(locationId);
-
-                    // Queue sentinel removal for real pickups.
-                    // Suppressed during level completion (end-of-level flag cleanup).
-                    if (_lastLevelCompleted != 1)
-                        _inventory.QueueSentinelRemoval();
-                }
-            }
-            else
-            {
-                // First time seeing this entity
+                // First sighting this level — this is the baseline, never a pickup,
+                // even when the flag already reads "collected" on entry.
                 _entityFlags[entityIndex] = currentFlags;
+                continue;
+            }
+
+            if (currentFlags == previousFlags)
+                continue;
+
+            // Real, just-now pickup. Advance the baseline first so the change is
+            // reported exactly once.
+            _entityFlags[entityIndex] = currentFlags;
+
+            // Server-truth dedup: the server decides whether this is a new check.
+            bool isNew = _session.SendLocationCheck(locationId);
+            if (isNew)
+            {
+                string locName = _session.GetLocationName(locationId);
+                ConsoleUI.ItemSent(locName, "Archipelago");
+            }
+
+            // The patched sentinel entity is a small medipack the game grants
+            // natively the instant it is collected. Strip it for EVERY real pickup,
+            // whether or not the AP check was new, otherwise the player keeps the
+            // parasitic medipack with no matching AP send. Suppressed only during
+            // level-completion flag cleanup.
+            if (_lastLevelCompleted != 1)
+            {
+                _inventory.QueueSentinelRemoval();
+                ConsoleUI.Info($"[SENTINEL] pick removed loc={locationId} (send={(isNew ? "new" : "dup")})");
             }
         }
     }
@@ -819,18 +923,32 @@ public class GameStateWatcher : IDisposable
         while (_pendingItems.Count > 0)
         {
             var (itemId, category) = _pendingItems.Dequeue();
-            switch (category)
+            bool ok = category switch
             {
-                case ItemMapper.ItemCategory.Weapon:
-                    _inventory.GiveWeapon(itemId);
-                    break;
-                case ItemMapper.ItemCategory.Ammo:
-                    _inventory.GiveAmmo(itemId);
-                    break;
-                case ItemMapper.ItemCategory.Medipack:
-                    _inventory.GiveMedipack(itemId);
-                    break;
+                ItemMapper.ItemCategory.Weapon => _inventory.GiveWeapon(itemId),
+                ItemMapper.ItemCategory.Ammo => _inventory.GiveAmmo(itemId),
+                ItemMapper.ItemCategory.Medipack => _inventory.GiveMedipack(itemId),
+                _ => true,
+            };
+
+            if (ok)
+            {
+                _itemsInjectedIndex++;
+                _injectionFailures = 0;
+                continue;
             }
+
+            // Injection failed (offsets quarantined / inventory not ready).
+            // Keep the item queued and stop — WriteGate already explained why.
+            _pendingItems.Enqueue((itemId, category));
+            if (++_injectionFailures >= 5)
+            {
+                ConsoleUI.Error(
+                    $"[INV] Giving up on {_pendingItems.Count} queued items this level — " +
+                    "will retry after the next level transition.");
+                _injectionFailures = 0;
+            }
+            break;
         }
     }
 
