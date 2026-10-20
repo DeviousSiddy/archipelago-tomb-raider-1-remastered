@@ -28,6 +28,7 @@ public class GameStateWatcher : IDisposable
     private readonly InventoryScanner _scanner;
     private readonly SaveStateStore _stateStore;
     private readonly KeyItemMonitor _keyMonitor;
+    private readonly GameSound _sound;
 
     // Cached base addresses
     private IntPtr _tomb1Base;
@@ -100,6 +101,7 @@ public class GameStateWatcher : IDisposable
         _stateStore = stateStore;
         _saveFile = saveFile;
         _keyMonitor = new KeyItemMonitor(memory);
+        _sound = new GameSound(memory);
     }
 
     /// <summary>
@@ -717,6 +719,7 @@ public class GameStateWatcher : IDisposable
             {
                 string locName = _session.GetLocationName(locationId);
                 ConsoleUI.ItemSent(locName, "Archipelago");
+                _sound.Play(TR1RMemoryMap.SfxSecret, "AP check sent");
             }
 
             // The patched sentinel entity is a small medipack the game grants
@@ -763,6 +766,7 @@ public class GameStateWatcher : IDisposable
 
                     string levelName = TR1RMemoryMap.LevelNames.GetValueOrDefault(_lastLevelId, "Unknown");
                     ConsoleUI.SecretFound(s + 1, levelName);
+                    _sound.Play(TR1RMemoryMap.SfxSecret, "secret found");
                 }
             }
 

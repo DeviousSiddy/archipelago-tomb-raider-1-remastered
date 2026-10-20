@@ -401,6 +401,54 @@ public static class TR1RMemoryMap
         0x48, 0x83, 0xEC, 0x20,
     };
 
+    // ----- Sound -----
+
+    /// <summary>
+    /// Sound_Effect(int32 sfx, const XYZ_32 *pos, uint32 flags) — tomb1.dll RVA.
+    ///
+    /// Proven by full disassembly: 84 call sites pass ecx = sample id,
+    /// rdx = position pointer (or NULL for non-positional), r8d = flags; the
+    /// body indexes the level sound map at 0x377920 (-1/-2 sentinels) and owns
+    /// the MssSetPlayingLutIndex bound error (ids 0..0x171). Observed constant
+    /// ids match the engine's own SFX_* catalog one for one (0x09 WOLF_HURT,
+    /// 0x25 LION_HURT, 0x1E PUSHBLOCK_LAND, 0x0D LARA_INJURY, 0x30 MENU_COMPASS,
+    /// 0x46 SECRET), including two call sites that pass SFX_SECRET.
+    ///
+    /// Takes three register arguments, so it cannot be driven by CallRemote
+    /// (thread parameter only reaches RCX) — use ProcessMemory.CallRemote3.
+    /// </summary>
+    public static int SoundEffect = 0x88480;
+
+    /// <summary>
+    /// Expected prologue of Sound_Effect (21 bytes, current build):
+    ///   48 89 5C 24 10  mov [rsp+10],rbx
+    ///   44 89 44 24 18  mov [rsp+18],r8d   ; flags saved first — arg3 exists
+    ///   55              push rbp
+    ///   56              push rsi
+    ///   57              push rdi
+    ///   41 54           push r12
+    ///   41 55           push r13
+    ///   41 56           push r14
+    ///   41 57           push r15
+    /// Refuse every remote call if live bytes differ (patch changed under us).
+    /// </summary>
+    public static readonly byte[] SoundEffectSignature =
+    {
+        0x48, 0x89, 0x5C, 0x24, 0x10,
+        0x44, 0x89, 0x44, 0x24, 0x18,
+        0x55, 0x56, 0x57,
+        0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+    };
+
+    /// <summary>
+    /// AP-check / secret feedback chime — catalog id 2 (SFX_LARA_NO).
+    /// Proven to always be loaded (present in every level's sound map), so it is a
+    /// reliable audible cue. The semantically-correct SFX_SECRET is id 70, but this
+    /// build's per-level map does not load it everywhere (level 1 -> -1), so the
+    /// engine is silent there.
+    /// </summary>
+    public const int SfxSecret = 2;
+
     // ----- Camera -----
 
     public static int  CameraX = 0x2cb92c;

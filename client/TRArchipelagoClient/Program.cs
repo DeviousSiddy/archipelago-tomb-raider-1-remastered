@@ -78,6 +78,24 @@ class Program
             return;
         }
 
+        if (args.Contains("--sound-probe"))
+        {
+            await RunSoundProbeMode(args);
+            return;
+        }
+
+        if (args.Contains("--dump-sfx-table"))
+        {
+            await RunDumpSfxTableMode(args);
+            return;
+        }
+
+        if (args.Contains("--watch-sfx"))
+        {
+            await RunWatchSfxMode(args);
+            return;
+        }
+
         // --- Normal AP mode ---
         string server = GetArg(args, 0, null) ?? ConsoleUI.Prompt("Archipelago server (host:port)");
         string? slotName = GetArg(args, 1, null) ?? ConsoleUI.Prompt("Slot name");
@@ -92,6 +110,18 @@ class Program
         {
             ConsoleUI.Error($"Game directory not found: {gameDir}");
             return;
+        }
+
+        // Self-heal: a previous run that was killed (instead of exiting through
+        // the finally block) leaves the level files patched — every pickup then
+        // grants a small medipack in normal play. Restore any leftover backups
+        // BEFORE patching so every session starts from pristine files.
+        var startupBackups = new BackupManager(gameDir);
+        if (startupBackups.HasBackups())
+        {
+            ConsoleUI.Warning("Leftover level backups found — previous run did not shut down cleanly.");
+            startupBackups.RestoreAll();
+            ConsoleUI.Success("Original level files restored before patching.");
         }
 
         // Detect and swap save files before anything else
@@ -165,8 +195,11 @@ class Program
         {
             saveManager.SwapOut();
 
-            if (patcher?.BackupManager.HasBackups() == true &&
-                ConsoleUI.Confirm("Restore original level files?"))
+            // ALWAYS restore. Leaving the level files patched silently breaks
+            // normal play (sentinel pickups grant small medipacks instead of the
+            // real item), and the old y/n prompt defaulted to "no" whenever stdin
+            // was unavailable — which is every background/redirected run.
+            if (patcher?.BackupManager.HasBackups() == true)
             {
                 patcher.BackupManager.RestoreAll();
                 ConsoleUI.Success("Original files restored.");
@@ -1222,6 +1255,168 @@ class Program
     private static string? GetArg(string[] args, int index, string? defaultValue)
     {
         return index < args.Length ? args[index] : defaultValue;
+    }
+
+    /// <summary>
+    /// Attaches to tomb123.exe and plays a run of SFX_SECRET chimes, then a few
+    /// reference ids, so the Sound_Effect remote-call path can be validated live
+    /// inside a running level. Usage:
+    ///   TRArchipelagoClient.exe --sound-probe [sfxId ...]
+    /// Ids are the engine's own sound catalog ids; with no extra args it plays
+    /// SFX_SECRET (70) three times, then 9 (wolf) and 0x30 (menu compass) once
+    /// each as audible controls.
+    /// </summary>
+    private static async Task RunSoundProbeMode(string[] args)
+    {
+        var idArgs = args
+            .Where(a => !a.StartsWith("--") && int.TryParse(a, out _))
+            .Select(int.Parse)
+            .ToList();
+
+        var memory = new ProcessMemory();
+        ConsoleUI.Info("Waiting for tomb123.exe to attach...");
+        for (int i = 0; i < 60 && !memory.IsAttached; i++)
+        {
+            memory.TryAttach();
+            if (!memory.IsAttached)
+                await Task.Delay(1000);
+        }
+        if (!memory.IsAttached)
+        {
+            ConsoleUI.Error("tomb123.exe not found (start the game and try again).");
+            return;
+        }
+
+        if (memory.Tomb1Base == IntPtr.Zero)
+            memory.RefreshTomb1Base();
+        if (memory.Tomb1Base == IntPtr.Zero)
+        {
+            ConsoleUI.Error("tomb1.dll not loaded yet (get past the menu into a level).");
+            return;
+        }
+
+        var sound = new GameSound(memory);
+
+        var plan = idArgs.Count > 0
+            ? idArgs.Select(id => (Id: id, What: "probe")).ToList()
+            : new List<(int Id, string What)>
+            {
+                (TR1RMemoryMap.SfxSecret, "probe secret #1"),
+                (TR1RMemoryMap.SfxSecret, "probe secret #2"),
+                (TR1RMemoryMap.SfxSecret, "probe secret #3"),
+                (9, "probe wolf reference"),
+                (0x30, "probe menu-compass reference"),
+            };
+
+        foreach (var (id, what) in plan)
+        {
+            ConsoleUI.Info($"Probing sfx={id} ({what})...");
+            for (int burst = 0; burst < 3; burst++)
+            {
+                sound.Play(id, what);
+                await Task.Delay(300);
+            }
+            await Task.Delay(400);
+        }
+
+        ConsoleUI.Success("Sound probe complete.");
+        memory.Dispose();
+    }
+
+    /// <summary>
+    /// Dumps a run of 16-bit words from a live tomb1.dll RVA so the engine's
+    /// runtime-populated tables (notably the id → sound-map at 0x377920, which
+    /// is all zeros on disk) can be read out of a running game. Usage:
+    ///   TRArchipelagoClient.exe --dump-sfx-table [rva] [count]
+    /// Defaults to 0x377920, 0x200 words.
+    /// </summary>
+    private static async Task RunDumpSfxTableMode(string[] args)
+    {
+        int rva = 0x377920;
+        int count = 0x200;
+        var nums = args.Where(a => !a.StartsWith("--")).ToList();
+        if (nums.Count >= 1) rva = Convert.ToInt32(nums[0], 16);
+        if (nums.Count >= 2) count = Convert.ToInt32(nums[1], 16);
+
+        var memory = new ProcessMemory();
+        for (int i = 0; i < 60 && !memory.IsAttached; i++)
+        {
+            memory.TryAttach();
+            if (!memory.IsAttached)
+                await Task.Delay(1000);
+        }
+        if (!memory.IsAttached) { ConsoleUI.Error("tomb123.exe not found."); return; }
+        if (memory.Tomb1Base == IntPtr.Zero) memory.RefreshTomb1Base();
+        if (memory.Tomb1Base == IntPtr.Zero) { ConsoleUI.Error("tomb1.dll not loaded."); return; }
+
+        IntPtr t1 = memory.Tomb1Base;
+        ConsoleUI.Info($"Dumping {count} words from tomb1.dll+0x{rva:X} (base 0x{t1:X})...");
+        for (int i = 0; i < count; i++)
+        {
+            short v = memory.ReadInt16(t1 + rva + i * 2);
+            Console.WriteLine($"id {i,4} 0x{i:X4}: {v,6}");
+        }
+        memory.Dispose();
+    }
+
+    /// <summary>
+    /// Watches the engine's 32 active sample voices (stride 0x10 at tomb1.dll+0x12CB30,
+    /// count at [voice] = sample index) and prints every change, so a sound the
+    /// player triggers in-game can be attributed to its sound-catalog id by
+    /// matching the fired sample index against the live id → sample map
+    /// (word[base + 0x377920 + id*2]). Usage:
+    ///   TRArchipelagoClient.exe --watch-sfx [seconds]
+    /// </summary>
+    private static async Task RunWatchSfxMode(string[] args)
+    {
+        int seconds = 60;
+        var nums = args.Where(a => !a.StartsWith("--")).ToList();
+        if (nums.Count >= 1) int.TryParse(nums[0], out seconds);
+
+        var memory = new ProcessMemory();
+        for (int i = 0; i < 60 && !memory.IsAttached; i++)
+        {
+            memory.TryAttach();
+            if (!memory.IsAttached) await Task.Delay(1000);
+        }
+        if (!memory.IsAttached) { ConsoleUI.Error("tomb123.exe not found."); return; }
+        if (memory.Tomb1Base == IntPtr.Zero) memory.RefreshTomb1Base();
+        if (memory.Tomb1Base == IntPtr.Zero) { ConsoleUI.Error("tomb1.dll not loaded."); return; }
+
+        IntPtr t1 = memory.Tomb1Base;
+        // Voice slots: base 0x12CB30, stride 0x10. Field +0x0 is the playback
+        // cursor/position (churns constantly, not the id); the sample id lives at
+        // field +0x8, proven by Sound_Effect's store at 0x180088A99:
+        //   mov dword [rbx + rax*8 + 0x12cb38], r13d   (rbx=0x12cb30, rax=slot*2)
+        const int VoiceTable = 0x12CB30;
+        const int VoiceStride = 0x10;
+        const int VoiceSampleOff = 0x8;
+        const int VoiceCount = 0x20;
+
+        short[] last = new short[VoiceCount];
+        for (int v = 0; v < VoiceCount; v++)
+            last[v] = (short)memory.ReadInt32(t1 + VoiceTable + v * VoiceStride + VoiceSampleOff);
+
+        ConsoleUI.Info($"Watching {VoiceCount} voices at tomb1.dll+0x{VoiceTable:X} (sample field +0x{VoiceSampleOff:X}) for {seconds}s...");
+        ConsoleUI.Info("Trigger the sound in-game now.");
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (sw.Elapsed.TotalSeconds < seconds)
+        {
+            for (int v = 0; v < VoiceCount; v++)
+            {
+                int cur = memory.ReadInt32(t1 + VoiceTable + v * VoiceStride + VoiceSampleOff);
+                short prev = last[v];
+                if ((short)cur == prev) continue;
+                last[v] = (short)cur;
+                if (cur <= 0) continue;
+                Console.WriteLine($"[{sw.Elapsed.TotalSeconds,6:F1}s] voice {v,2}: sampleId {prev} -> {cur}");
+            }
+            await Task.Delay(25);
+        }
+
+        ConsoleUI.Success("Watch complete.");
+        memory.Dispose();
     }
 
     /// <summary>
