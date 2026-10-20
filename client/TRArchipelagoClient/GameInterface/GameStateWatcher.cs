@@ -49,9 +49,11 @@ public class GameStateWatcher : IDisposable
     private int _itemsInjectedIndex;
     private int _injectionFailures;
     private int _lastSaveNumber = -1;
+    private int _lastKnownSaveNumber = -1;
 
     // The save number of the currently active snapshot (for save-aware checks)
     private int _activeSaveNumber = -1;
+    private bool _enteredMenu;
 
     // Tracks KeyItemsEnsured transition to re-snapshot the KeyItemMonitor
     private bool _lastKeyItemsEnsured;
@@ -78,6 +80,7 @@ public class GameStateWatcher : IDisposable
     // reinitializing entities/inventory before monitoring.
     private int _levelSettleTicks;
     private bool _settleFromMenu; // true = menu→game, false = level→level
+    private int _suppressSentinelTicks;
 
     // Which entity indices are AP locations (set by LevelPatcher)
     private readonly Dictionary<int, Dictionary<int, long>> _levelEntityLocations;
@@ -168,6 +171,9 @@ public class GameStateWatcher : IDisposable
 
     private void PollGameState()
     {
+        if (_suppressSentinelTicks > 0)
+            _suppressSentinelTicks--;
+
         // Check if we're in-game (not menu/loading)
         int inGameScene = _memory.ReadInt32(_tomb1Base, TR1RMemoryMap.IsInGameScene);
         bool isInGame = inGameScene > 0;
@@ -398,6 +404,7 @@ public class GameStateWatcher : IDisposable
     private void OnSaveLoaded(int saveNumber, int levelId)
     {
         ConsoleUI.Info($"[SAVE] Save loaded (save #{saveNumber})");
+        _suppressSentinelTicks = 150;
 
         // Re-snapshot entity flags for the current game state (post-load)
         _entityFlags.Clear();
@@ -540,7 +547,17 @@ public class GameStateWatcher : IDisposable
 
         // Wait for the game engine to finish initializing entities/rings
         // before monitoring. OnSettleComplete takes fresh snapshots once stable.
-        _settleFromMenu = previousLevelId == -1;
+        if (previousLevelId == -1)
+        {
+            _enteredMenu = true;
+            _activeSaveNumber = -1;
+            _pendingItems.Clear();
+            _settleFromMenu = true;
+        }
+        else
+        {
+            _settleFromMenu = false;
+        }
         _levelSettleTicks = 20; // 2 seconds (20 × 100ms)
     }
 
@@ -571,8 +588,14 @@ public class GameStateWatcher : IDisposable
             _tomb1Base + TR1RMemoryMap.WorldStateBackup + TR1RMemoryMap.Runtime_SecretsFound);
         _lastHealth = _memory.ReadInt16(_laraPtr + TR1RMemoryMap.Item_HitPoints);
         _lastLevelCompleted = _memory.ReadInt32(_tomb1Base, TR1RMemoryMap.LevelCompleted);
-        _lastSaveNumber = _memory.ReadInt32(
+        int wsbSaveCounter = _memory.ReadInt32(
             _memory.Tomb1Base + TR1RMemoryMap.WorldStateBackup + TR1RMemoryMap.WSB_SaveCounter);
+        _lastSaveNumber = wsbSaveCounter;
+        if (_lastKnownSaveNumber < 0)
+            _lastKnownSaveNumber = wsbSaveCounter;
+        if (wsbSaveCounter >= 0)
+            _lastKnownSaveNumber = wsbSaveCounter;
+
         _scanner.Reset();
         _inventory.InvalidatePistolsPointer();
 
@@ -582,19 +605,30 @@ public class GameStateWatcher : IDisposable
 
         if (_settleFromMenu)
         {
-            // Detect new game vs loaded save from the Main Ring contents.
-            // New game: ring holds only Compass + Pistols (Compass is ring[0],
-            // Pistols sits Compass apart, so the walked length is 2).
-            // Loaded save: ring holds additional items carried in the save.
-            // Only trust the walk when the Ring offsets are usable; otherwise
-            // leave the decision to the next settle rather than guess.
-            short ringCount = OffsetIdentifier.RingWalk(_memory, TR1RMemoryMap.MainRingItems);
-            bool ringUsable = OffsetModel.Usable(OffsetGroup.Ring);
-            bool newGame = ringUsable && ringCount <= 2 && _allReceivedRingItems.Count > 0;
-
-            ConsoleUI.Info(
-                $"[GSW] Menu→game settle: ring={ringCount} ringUsable={ringUsable} " +
-                $"received={_allReceivedRingItems.Count} → {(newGame ? "NEW GAME" : "loaded save")}");
+            bool newGame = false;
+            bool hadSnapshotForSave = wsbSaveCounter >= 0 && _stateStore.HasSnapshot(wsbSaveCounter);
+            if (hadSnapshotForSave)
+            {
+                // Prefer known snapshot - treat as load
+                newGame = false;
+                ConsoleUI.Info($"[GSW] Menu→game settle: save#{wsbSaveCounter} has snapshot → LOADED SAVE");
+            }
+            else if (wsbSaveCounter == 0 && _lastKnownSaveNumber > 0 && _allReceivedRingItems.Count > 0)
+            {
+                // Save counter reset after a known run (e.g. NG+ -> NG)
+                newGame = true;
+                ConsoleUI.Info($"[GSW] Menu→game settle: save counter reset 0 (was {_lastKnownSaveNumber}) → NEW GAME");
+            }
+            else
+            {
+                // True fresh run - fall back to ring contents
+                short ringCount = OffsetIdentifier.RingWalk(_memory, TR1RMemoryMap.MainRingItems);
+                bool ringUsable = OffsetModel.Usable(OffsetGroup.Ring);
+                newGame = ringUsable && ringCount <= 2 && _allReceivedRingItems.Count > 0;
+                ConsoleUI.Info(
+                    $"[GSW] Menu→game settle: ring={ringCount} ringUsable={ringUsable} save#{wsbSaveCounter} " +
+                    $"received={_allReceivedRingItems.Count} → {(newGame ? "NEW GAME" : "loaded save")}");
+            }
 
             if (newGame)
             {
@@ -604,13 +638,23 @@ public class GameStateWatcher : IDisposable
                 // server owns check dedup, so nothing is re-sent here.
                 _stateStore.ResetForNewGame();
                 _activeSaveNumber = -1;
+                if (wsbSaveCounter >= 0)
+                    _lastKnownSaveNumber = wsbSaveCounter;
+        if (wsbSaveCounter >= 0)
+            _lastKnownSaveNumber = wsbSaveCounter;
                 _itemsInjectedIndex = 0;
                 _injectionFailures = 0;
                 _pendingItems.Clear();
                 foreach (var item in _allReceivedRingItems)
                     _pendingItems.Enqueue(item);
+                _enteredMenu = false;
                 ConsoleUI.Info($"[GSW] New game — replaying {_allReceivedRingItems.Count} ring items");
                 return;
+            }
+
+            if (_enteredMenu)
+            {
+                _enteredMenu = false;
             }
         }
 
@@ -621,7 +665,10 @@ public class GameStateWatcher : IDisposable
             _activeSaveNumber = _lastSaveNumber;
             var snapshot = _stateStore.GetSnapshot(_lastSaveNumber);
             if (snapshot != null)
+            {
+                _suppressSentinelTicks = 180;
                 ReconcileAfterLoad(snapshot, levelId);
+            }
         }
         else if (_lastSaveNumber >= 0)
         {
@@ -718,19 +765,23 @@ public class GameStateWatcher : IDisposable
             if (isNew)
             {
                 string locName = _session.GetLocationName(locationId);
-                ConsoleUI.ItemSent(locName, "Archipelago");
-                _sound.Play(TR1RMemoryMap.SfxSecret, "AP check sent");
+                ConsoleUI.Info($"[LOC] Checked: {locName}");
             }
 
             // The patched sentinel entity is a small medipack the game grants
             // natively the instant it is collected. Strip it for EVERY real pickup,
             // whether or not the AP check was new, otherwise the player keeps the
-            // parasitic medipack with no matching AP send. Suppressed only during
-            // level-completion flag cleanup.
-            if (_lastLevelCompleted != 1)
+            // parasitic medipack with no matching AP send. Suppressed during
+            // level-completion flag cleanup and for a short grace period after
+            // loading a save to avoid nuking medpacks restored by the save/load flow.
+            if (_lastLevelCompleted != 1 && _suppressSentinelTicks <= 0)
             {
                 _inventory.QueueSentinelRemoval();
                 ConsoleUI.Info($"[SENTINEL] pick removed loc={locationId} (send={(isNew ? "new" : "dup")})");
+            }
+            else if (_suppressSentinelTicks > 0)
+            {
+                ConsoleUI.Info($"[SENTINEL] suppressed on load/reconcile loc={locationId}");
             }
         }
     }
@@ -766,7 +817,6 @@ public class GameStateWatcher : IDisposable
 
                     string levelName = TR1RMemoryMap.LevelNames.GetValueOrDefault(_lastLevelId, "Unknown");
                     ConsoleUI.SecretFound(s + 1, levelName);
-                    _sound.Play(TR1RMemoryMap.SfxSecret, "secret found");
                 }
             }
 
@@ -861,6 +911,7 @@ public class GameStateWatcher : IDisposable
             string itemName = _session.GetItemName(item.ItemId);
             string playerName = _session.GetPlayerName(item.Player);
             ConsoleUI.ItemReceived(itemName, playerName);
+            _sound.Play(TR1RMemoryMap.SfxSecret, "AP item received");
             _itemsReceivedIndex++;
 
             var category = ItemMapper.GetCategory(item.ItemId);
@@ -870,6 +921,16 @@ public class GameStateWatcher : IDisposable
                 // Store key items so EnsureKeyItemsInRing can inject them later.
                 // GiveKeyItem only needs memory for immediate injection (same level);
                 // cross-level items are just stored in _receivedKeyItems.
+                string levelName = ItemMapper.GetKeyItemLevel(item.ItemId);
+                if (levelName != null)
+                {
+                    string displayLevel = TR1RMemoryMap.LevelNames.Values.FirstOrDefault(v => levelName.Contains(v, StringComparison.OrdinalIgnoreCase)) ?? levelName;
+                    ConsoleUI.Info($"[KEY] {itemName} received for {levelName} - will be added when entering {levelName}");
+                }
+                else
+                {
+                    ConsoleUI.Info($"[KEY] {itemName} received - will be added when entering the correct level");
+                }
                 _inventory.GiveKeyItem(item.ItemId, levelId);
             }
             else if (category != ItemMapper.ItemCategory.Trap)
@@ -898,6 +959,7 @@ public class GameStateWatcher : IDisposable
             string itemName = _session.GetItemName(item.ItemId);
             string playerName = _session.GetPlayerName(item.Player);
             ConsoleUI.ItemReceived(itemName, playerName);
+            _sound.Play(TR1RMemoryMap.SfxSecret, "AP item received");
             _itemsReceivedIndex++;
 
             var category = ItemMapper.GetCategory(item.ItemId);
@@ -910,6 +972,11 @@ public class GameStateWatcher : IDisposable
             }
             if (category == ItemMapper.ItemCategory.KeyItem)
             {
+                string levelName = ItemMapper.GetKeyItemLevel(item.ItemId);
+                if (levelName != null)
+                    ConsoleUI.Info($"[KEY] {itemName} received for {levelName} - will be added when entering {levelName}");
+                else
+                    ConsoleUI.Info($"[KEY] {itemName} received - will be added when entering the correct level");
                 _inventory.GiveKeyItem(item.ItemId, levelId);
                 continue;
             }
